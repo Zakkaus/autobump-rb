@@ -1,0 +1,63 @@
+# Manual self-test of the deploy chain in a REAL gentoo container: the same
+# container setup the gentoo-zh autobump.yml uses (make.conf/tooling/repos.conf fixes),
+# then the engine `--check` over the live nvchecker queue (dry-run, classify only).
+# Non-destructive (no bump, no PR). Proves "the engine runs on CI against real issues".
+name: selftest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: gentoo/stage3:amd64-desktop-openrc
+      options: --privileged
+
+    steps:
+    - name: sync gentoo main tree
+      run: emerge-webrsync
+
+    - name: setup portage
+      run: |
+        {
+          echo 'FEATURES="${FEATURES} getbinpkg"'
+          echo "MAKEOPTS=\"\${MAKEOPTS} -j$(nproc)\""
+        } >> /etc/portage/make.conf
+        getuto
+        install -dm775 -o root -g portage /var/cache/distfiles
+
+    - name: install tooling
+      run: |
+        emerge --quiet --getbinpkg --autounmask=y --autounmask-write=y --autounmask-continue=y \
+          dev-lang/ruby dev-vcs/git dev-util/pkgdev dev-util/pkgcheck \
+          app-portage/portage-utils dev-util/github-cli app-misc/jq net-misc/curl
+
+    - name: checkout engine
+      uses: actions/checkout@v4
+
+    - name: checkout gentoo-zh overlay
+      uses: actions/checkout@v4
+      with:
+        repository: gentoo-zh/overlay
+        path: overlay
+        fetch-depth: 1
+
+    - name: register gentoo repos.conf (pkgcore)
+      run: |
+        mkdir -p /etc/portage/repos.conf
+        cat > /etc/portage/repos.conf/gentoo.conf << EOF
+        [DEFAULT]
+        main-repo = gentoo
+
+        [gentoo]
+        location = $(portageq get_repo_path / gentoo)
+        EOF
+        git config --global --add safe.directory "$(realpath overlay)"
+
+    - name: dry-run — engine --check over the live queue (no bump, no PR)
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        AUTOBUMP_REPO="$(realpath overlay)" bash tools/shadow-check.sh

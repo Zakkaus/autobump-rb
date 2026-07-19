@@ -1,0 +1,102 @@
+# Real-container test harness: run the DEPLOYED autobump scripts (sweep/probe/discover) and the
+# engine itself in the SAME container autobump.yml uses (stage3-desktop + getuto + ci-binhost +
+# full tooling). This exercises the parts that only review/unit-tests covered -- the whole chain
+# minus the App-token PR push (sweep runs without --pr). Manual only; nothing is pushed.
+name: autobump-container-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'sweep | probe | discover | engine'
+        required: true
+        default: 'probe'
+      target:
+        description: 'sweep: issue number; engine: "cat/pkg ver [--check|--install]"'
+        required: false
+        default: ''
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: gentoo/stage3:amd64-desktop-openrc
+      options: --privileged
+    steps:
+    - name: sync gentoo tree
+      run: emerge-webrsync
+
+    - name: setup portage (identical to autobump.yml)
+      run: |
+        {
+          echo 'FEATURES="${FEATURES} getbinpkg"'
+          echo "MAKEOPTS=\"-j$(nproc)\""
+          echo 'PORTAGE_ELOG_CLASSES="qa warn error"'
+          echo 'PORTAGE_ELOG_SYSTEM="save"'
+          echo 'ACCEPT_LICENSE="*"'
+        } >> /etc/portage/make.conf
+        mkdir -p /etc/portage/package.use
+        cat > /etc/portage/package.use/ci-binhost << 'EOF'
+        dev-qt/qtwebengine bindist
+        net-libs/webkit-gtk keyring
+        EOF
+        getuto
+        install -dm775 -o root -g portage /var/cache/distfiles
+
+    - name: install tooling
+      run: |
+        mkdir -p /etc/portage/package.use
+        echo "x11-base/xorg-server xvfb minimal -xorg" > /etc/portage/package.use/autobump-xvfb
+        emerge --quiet --getbinpkg --autounmask=y --autounmask-write=y --autounmask-continue=y \
+          dev-lang/ruby dev-vcs/git dev-util/pkgdev dev-util/pkgcheck app-portage/portage-utils \
+          app-portage/iwdevtools dev-util/github-cli app-misc/jq net-misc/curl x11-base/xorg-server
+
+    - name: checkout engine
+      uses: actions/checkout@v4
+
+    - name: checkout overlay (the deploy branch -- has the autobump scripts, not yet in master)
+      uses: actions/checkout@v4
+      with:
+        repository: Zakkaus/gentoo-zh
+        ref: deploy-autobump-ruby
+        fetch-depth: 0
+        path: overlay
+
+    - name: register overlay + repos.conf
+      run: |
+        mkdir -p /etc/portage/repos.conf
+        cat > /etc/portage/repos.conf/gentoo.conf << EOF
+        [DEFAULT]
+        main-repo = gentoo
+        [gentoo]
+        location = $(portageq get_repo_path / gentoo)
+        EOF
+        cat > /etc/portage/repos.conf/repo.conf << EOF
+        [$(cat overlay/profiles/repo_name)]
+        location = $(realpath overlay)
+        priority = 0
+        EOF
+        git config --global --add safe.directory "$(realpath overlay)"
+        git config --global user.name autobump-test
+        git config --global user.email test@gentoozh.org
+
+    - name: run
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MODE: ${{ github.event.inputs.mode }}
+        TARGET: ${{ github.event.inputs.target }}
+      run: |
+        # use the CONTAINER $GITHUB_WORKSPACE env var, NOT the ${{ github.workspace }} expression:
+        # in a container job the expression is the HOST path (/home/runner/work/...) which is not
+        # mounted inside the container (it lives at /__w/...). Same gotcha autobump.yml documents.
+        export AUTOBUMP_ENGINE="ruby $GITHUB_WORKSPACE/bin/autobump"
+        export AUTOBUMP_REPO="$GITHUB_WORKSPACE/overlay"
+        cd overlay
+        case "$MODE" in
+          sweep)    bash scripts/autobump-sweep.sh $TARGET --limit 1 ;;   # no --pr: bump+build+commit locally
+          probe)    bash scripts/autobump-probe.sh --limit 12 ;;
+          discover) AUTOBUMP_DISCOVER_REF=HEAD bash scripts/autobump-discover.sh 300 3 80 ;;
+          engine)   ruby "$GITHUB_WORKSPACE/bin/autobump" $TARGET ;;
+          *) echo "unknown mode: $MODE" >&2; exit 2 ;;
+        esac

@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+# CI containers (gentoo/stage3) default to a C/POSIX locale, which makes Ruby's default
+# string encoding US-ASCII; any non-ASCII byte from a subprocess (emerge/pkgcheck/git
+# output, a unicode filename) then raises "invalid byte sequence in US-ASCII". Force UTF-8
+# so the engine is locale-independent -- the dev box's UTF-8 locale hid this entirely.
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+require_relative '../lib/autobump'
+Autobump::CLI.run(ARGV)

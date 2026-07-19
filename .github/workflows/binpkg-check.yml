@@ -1,0 +1,81 @@
+# Diagnostic: in the SAME container autobump.yml uses (stage3-desktop + getuto +
+# EMERGE_DEFAULT_OPTS="--getbinpkg --usepkg"), prove what happens to a bump whose dependency is
+# a heavy package. Runs the engine's own heavy-dep pre-check on a real overlay package that
+# depends on webkit-gtk, so the answer is "would it timeout?" for real, not from the binhost
+# index. Manual only.
+name: binpkg-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'overlay package (depends on a heavy pkg) to probe'
+        required: false
+        default: 'media-gfx/bambustudio-bin'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: gentoo/stage3:amd64-desktop-openrc
+      options: --privileged
+    steps:
+    - name: sync gentoo tree
+      run: emerge-webrsync
+
+    - name: setup portage (same as autobump.yml, incl package.use/ci-binhost)
+      run: |
+        {
+          echo 'FEATURES="${FEATURES} getbinpkg"'
+          echo "MAKEOPTS=\"-j$(nproc)\""
+          echo 'ACCEPT_LICENSE="*"'
+        } >> /etc/portage/make.conf
+        mkdir -p /etc/portage/package.use
+        cat > /etc/portage/package.use/ci-binhost << 'EOF'
+        dev-qt/qtwebengine bindist
+        net-libs/webkit-gtk keyring
+        EOF
+        getuto
+        install -dm775 -o root -g portage /var/cache/distfiles
+
+    - name: install ruby (for the engine verdict)
+      run: emerge --quiet --getbinpkg --autounmask=y --autounmask-write=y --autounmask-continue=y dev-lang/ruby
+
+    - name: checkout engine
+      uses: actions/checkout@v4
+
+    - name: checkout overlay
+      uses: actions/checkout@v4
+      with:
+        repository: gentoo-zh/overlay
+        path: overlay
+
+    - name: register overlay
+      run: |
+        mkdir -p /etc/portage/repos.conf
+        cat > /etc/portage/repos.conf/gentoo.conf << EOF
+        [DEFAULT]
+        main-repo = gentoo
+        [gentoo]
+        location = $(portageq get_repo_path / gentoo)
+        EOF
+        cat > /etc/portage/repos.conf/repo.conf << EOF
+        [$(cat overlay/profiles/repo_name)]
+        location = $(realpath overlay)
+        priority = 0
+        EOF
+
+    - name: does the engine defer a heavy-dep bump? (the real question)
+      run: |
+        set -o pipefail
+        T='${{ github.event.inputs.target || 'media-gfx/bambustudio-bin' }}'
+        ver=$(ls overlay/$T/*.ebuild | tail -1 | sed -E 's#.*-([0-9][^/]*)\.ebuild#\1#')
+        pn=$(basename "$T"); nv="$ver"
+        echo "== target: $T-$ver =="
+        echo "== emerge --pretend --getbinpkg --usepkg (heavy deps binary or ebuild?) =="
+        plan=$(emerge --pretend --getbinpkg --usepkg --autounmask=y --autounmask-write=n "=$T-$ver" 2>&1) || true
+        echo "$plan" | grep -E '\[binary|\[ebuild' | grep -iE 'webkit-gtk|qtwebengine|chromium|rust|nodejs' || echo "(no heavy dep line)"
+        echo
+        echo "== engine verdict (BuildTest.heavy_in_plan on the REAL plan) =="
+        printf '%s' "$plan" | ruby -e 'require "./lib/autobump"; p=STDIN.read; h=Autobump::BuildTest.heavy_in_plan(p, ENV["PN"], ENV["NV"]); if h.empty?; puts "VERDICT: no heavy source dep -> bump BUILDS (binpkg / light source), no timeout"; else; puts "VERDICT: heavy source dep #{h.inspect} -> engine DEFERS before emerge -> NO timeout"; end' PN="$pn" NV="$nv"

@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  decisions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: syntax
+        run: for f in lib/autobump.rb lib/autobump/*.rb bin/autobump; do ruby -c "$f"; done
+      - name: golden decision test (hermetic fixtures)
+        run: bash test/decisions.sh
+      - name: PR-body golden test (hermetic)
+        run: ruby test/pr_body.rb
+      - name: heavy-dep pre-check test (hermetic)
+        run: ruby test/heavy_dep.rb
